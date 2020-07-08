@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	systemdDbus "github.com/coreos/go-systemd/dbus"
 	ign "github.com/coreos/ignition/config/v2_2"
 	igntypes "github.com/coreos/ignition/config/v2_2/types"
 	"github.com/golang/glog"
@@ -25,6 +24,7 @@ import (
 	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
 	"github.com/openshift/machine-config-operator/pkg/daemon/constants"
+	"github.com/openshift/machine-config-operator/pkg/daemon/pivot/reboot"
 	pivotutils "github.com/openshift/machine-config-operator/pkg/daemon/pivot/utils"
 	errors "github.com/pkg/errors"
 	"github.com/vincent-petithory/dataurl"
@@ -336,28 +336,8 @@ func (dn *Daemon) update(oldConfig, newConfig *mcfgv1.MachineConfig) (retErr err
 	dn.logSystem("Starting update from %s to %s: %+v", oldConfigName, newConfigName, diff)
 	rebootRequired := diff.osUpdate || diff.kargs || diff.fips || diff.kernelType
 
-	systemdConnection, dbusConnErr := systemdDbus.NewSystemConnection()
-	if dbusConnErr == nil {
-		defer systemdConnection.Close()
-	} else {
-		glog.Warningf("Unable to establish systemd dbus connection: %s", dbusConnErr)
-		// No more actions needed here as a systemd connection is not always
-		// required (only if there is systemd related post update action
-		// present). If a connection should be required, getPostUpdateActions
-		// function will return error if nil connection is provided and then
-		// rebootRequired will be se to true
-	}
-
-	postUpdateActions, err := getPostUpdateActions(
-		getFilesChanges(oldIgnConfig.Storage.Files, newIgnConfig.Storage.Files),
-		getUnitsChanges(oldIgnConfig.Systemd.Units, newIgnConfig.Systemd.Units),
-		systemdConnection,
-	)
-	if err != nil {
-		rebootRequired = true
-	}
-
-	drainRequired := rebootRequired || isDrainRequired(postUpdateActions)
+	rebootFilter := reboot.NewFilter(oldIgnConfig, newIgnConfig)
+	drainRequired := rebootFilter.IsRebootRequired || rebootFilter.IsDrainRequired
 
 	if drainRequired {
 		if err := dn.drain(); err != nil {
@@ -436,7 +416,7 @@ func (dn *Daemon) update(oldConfig, newConfig *mcfgv1.MachineConfig) (retErr err
 	if err := dn.updateOS(newConfig); err != nil {
 		return err
 	}
-	if rebootRequired || runPostUpdateActions(postUpdateActions) {
+	if rebootRequired || rebootFilter.RunPostUpdateActions() {
 		return dn.drainAndReboot(newConfig)
 	}
 	glog.Info("Reboot skipped as it is not required")
